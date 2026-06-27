@@ -16,6 +16,15 @@ import (
 )
 
 // FileSystemStorage 基于文件系统来存储锁，可以用作同一台机器上的不同进程之间互相协同工作，优势是兼容性好，只要有文件系统能读写文件就能使用这种锁
+//
+// ⚠️ 安全警告：此实现的 CAS（Compare-And-Set）语义存在 Check-Then-Act 竞态条件。
+// UpdateWithVersion 和 DeleteWithVersion 中的"先读取检查再操作"不是原子的，
+// 在多进程并发场景下可能导致多个进程同时通过版本检查，从而破坏锁的互斥性。
+// 因此，此实现仅适用于以下场景：
+//   - 单进程内的锁协调
+//   - 低并发的多进程场景（竞争概率极低）
+//   - 测试和开发环境
+// 生产环境的高并发场景请使用基于数据库（MySQL、PostgreSQL 等）或 Redis 的存储实现。
 type FileSystemStorage struct {
 	workspace string
 }
