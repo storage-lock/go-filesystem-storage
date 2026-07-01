@@ -74,12 +74,19 @@ func (x *FileSystemStorage) GetName() string {
 //   （Linux/macOS；其它平台见类型文档的平台说明）。
 // CapabilityReliableTime：成立——单机文件系统，本地时钟在单机内天然一致。
 // CapabilityAtomicDelete：成立——DeleteWithVersion 同样在 flock 临界区内"校验版本+删除"。
+//
+// 平台注意：CapabilityCAS/AtomicDelete 仅在支持 flock 的平台（Linux/macOS）声明。
+// 非 Unix 平台 flock 不可用，多进程 CAS 不成立，不声明该能力——NewStorageLockWithOptions
+// 的能力校验会拒绝将其用于分布式锁，避免静默不安全。如需 Windows 多进程安全，应实现
+// LockFileEx 版本的 flock 并把 flockSupported 改 true。
 func (x *FileSystemStorage) Capabilities() []storage.StorageCapability {
-	return []storage.StorageCapability{
-		storage.CapabilityCAS,
-		storage.CapabilityReliableTime,
-		storage.CapabilityAtomicDelete,
+	caps := []storage.StorageCapability{
+		storage.CapabilityReliableTime, // 单机本地时钟，单机内天然一致
 	}
+	if flockSupported {
+		caps = append(caps, storage.CapabilityCAS, storage.CapabilityAtomicDelete)
+	}
+	return caps
 }
 
 func (x *FileSystemStorage) Init(ctx context.Context) error {
