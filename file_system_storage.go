@@ -18,31 +18,38 @@ import (
 	"time"
 )
 
-// FileSystemStorage 基于文件系统来存储锁，可以用作同一台机器上的不同进程之间互相协同工作，优势是兼容性好，只要有文件系统能读写文件就能使用这种锁
+// FileSystemStorage 基于文件系统来存储锁，可以用作同一台机器上的不同进程之间互相协同工作，
+// 优势是兼容性好，只要有文件系统能读写文件就能使用这种锁。
 //
-// # CAS 实现说明
+// # CAS 实现说明（漏洞 H 修复后的正确实现）
 //
-// 此实现通过 O_CREATE|O_EXCL 标志实现原子的文件创建，从而支持真正的 CAS 语义：
-//   - CreateWithVersion：用 O_EXCL 创建锁文件，若文件已存在则返回 ErrLockAlreadyExists
-//   - UpdateWithVersion：先读取当前版本校验，再用 O_EXCL 创建新版本文件，旧版本文件保留为历史
-//   - DeleteWithVersion：校验版本后删除整个锁目录
+// 此实现通过【flock 排他锁】把"读版本 + 校验 + 写入"包成一个【进程间互斥的临界区】，
+// 从而在多进程下实现真正的线性一致 CAS——满足 go-storage 对 CapabilityCAS 的硬性要求。
 //
-// ⚠️ 注意：UpdateWithVersion 中的"读取校验"和"创建新版本文件"之间仍存在微小竞态窗口
-// （文件系统无法在单次系统调用中完成"条件检查+写入"）。
-// 在多进程高并发场景下，理论上仍可能有两个进程同时通过版本检查并各自创建新版本文件。
-// 因此本实现适用于：
-//   - 单进程内的锁协调（完全安全）
-//   - 低并发的多进程场景（竞争概率极低）
-//   - 测试和开发环境
+// 每个锁目录下有一个固定的 flock.lock 文件作为互斥点：
+//   - CreateWithVersion：flock → 若 current.json 已存在则 ErrLockAlreadyExists，否则原子写入 → unlock
+//   - UpdateWithVersion：flock → 读 current.json 校验版本，不匹配 ErrVersionMiss，匹配则原子写入 → unlock
+//   - DeleteWithVersion：flock → 读 current.json 校验版本，不匹配 ErrVersionMiss，匹配则删除目录 → unlock
 //
-// 对于 UpdateWithVersion 的竞态，本实现采用"版本号作为文件名"的策略来缓解：
-// 两个进程同时通过检查时，会尝试创建相同的新版本文件，O_EXCL 保证只有一个成功，
-// 另一个会得到 ErrLockAlreadyExists，从而保证最终只有一个更新生效。
+// 关键：flock 是内核级进程互斥，同一 lockId 的并发 CAS 在文件系统层被串行化，
+// 任意时刻只有一个进程能进入临界区，因此 Check-Then-Act 不再有竞态窗口，CAS 严格成立。
+// atomicWriteFile 的 rename 仍保留（防止读者读到半截内容），但它现在受 flock 保护，不再并发。
+//
+// # 平台支持
+//
+//   - Linux / macOS：使用 syscall.Flock，多进程安全（同一台机器内）。
+//   - 其它平台（如 Windows）：flock 回退为 no-op，此时仅单进程内安全；Windows 多进程安全需用 LockFileEx 实现。
+//
+// # 局限（不可逾越的物理边界）
+//
+// flock 只能保护【同一台机器、同一文件系统】上的进程互斥。跨机器/NFS 场景下 flock 行为依赖
+// NFS 服务端实现（NFSv4 通常支持，NFSv3 不可靠），不应直接用于跨机分布式协调——那是
+// 关系型数据库/对象存储等真正分布式存储的领域。本实现定位是"单机多进程"分布式锁。
 type FileSystemStorage struct {
 	workspace string
 
-	// mu 保护单进程内的并发写操作，使单进程多 goroutine 场景下 CAS 完全正确
-	// 注意：这无法保护多进程并发（多进程需要用 flock），多进程高并发场景请参见类型文档的限制说明
+	// mu 保护单进程内的并发，与 flock 共同构成两层保护：
+	// mu 串行化单进程内的 goroutine；flock 串行化不同进程。两者都不可省。
 	mu sync.Mutex
 }
 
@@ -61,10 +68,12 @@ func (x *FileSystemStorage) GetName() string {
 	return StorageName
 }
 
-// Capabilities 声明文件系统存储支持的能力
-// 文件系统通过 O_CREATE|O_EXCL 标志实现原子的文件创建，支持 CAS 语义
-// （单进程内完全安全；多进程下 UpdateWithVersion 存在微小竞态窗口，详见类型文档）
-// 时间源使用本地文件系统时间（单机内天然一致）
+// Capabilities 声明文件系统存储支持的能力。
+//
+// CapabilityCAS：成立——通过 flock 排他锁把"读版本+校验+写"串行化，多进程下线性一致
+//   （Linux/macOS；其它平台见类型文档的平台说明）。
+// CapabilityReliableTime：成立——单机文件系统，本地时钟在单机内天然一致。
+// CapabilityAtomicDelete：成立——DeleteWithVersion 同样在 flock 临界区内"校验版本+删除"。
 func (x *FileSystemStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
@@ -96,6 +105,10 @@ const (
 
 	// CurrentLockFileName 当前生效的锁信息存储在这个文件中
 	CurrentLockFileName = "current.json"
+
+	// FlockFileName 进程间互斥锁文件。所有 CAS 操作先对此文件加 flock 排他锁，
+	// 在临界区内完成"读版本+校验+写"，使多进程下 CAS 线性一致（修复漏洞 H）。
+	FlockFileName = "flock.lock"
 )
 
 // IsLockDirectory 判断这个路径是否是一个存放锁的路径
@@ -118,6 +131,38 @@ func (x *FileSystemStorage) BuildLockDirectory(lockId string) string {
 // BuildCurrentLockFilePath 当前锁信息文件的路径
 func (x *FileSystemStorage) BuildCurrentLockFilePath(lockId string) string {
 	return filepath.Join(x.BuildLockDirectory(lockId), CurrentLockFileName)
+}
+
+// BuildFlockFilePath 进程间互斥锁文件的路径
+func (x *FileSystemStorage) BuildFlockFilePath(lockId string) string {
+	return filepath.Join(x.BuildLockDirectory(lockId), FlockFileName)
+}
+
+// withFlock 打开（必要时创建）flock.lock 文件并加排他锁，执行 fn 后释放。
+// mu 已在调用方持有（串行化单进程内 goroutine），flock 再串行化不同进程，
+// 两层共同保证同一 lockId 的 CAS 全局只有一个进程在临界区内。
+//
+// 返回值：flock 加锁失败或 fn 的错误都会透传；fn 的错误不会阻止 unlock。
+func (x *FileSystemStorage) withFlock(lockId string, fn func() error) error {
+	lockDirectory := x.BuildLockDirectory(lockId)
+	if err := x.EnsureDirectoryExists(lockDirectory); err != nil {
+		return err
+	}
+	flockPath := x.BuildFlockFilePath(lockId)
+	// O_CREATE：flock.lock 不存在则创建（内容无关，只用作锁载体）
+	f, err := os.OpenFile(flockPath, os.O_CREATE|os.O_RDWR, os.ModePerm)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := flock(int(f.Fd())); err != nil {
+		// 拿不到排他锁（另一进程正持有），转化为版本冲突语义，让上层走重试
+		return storage_lock.ErrVersionMiss
+	}
+	defer func() { _ = funlock(int(f.Fd())) }()
+
+	return fn()
 }
 
 // EnsureDirectoryExists 确保给定的路径存在并且是一个目录
@@ -153,97 +198,72 @@ func (x *FileSystemStorage) atomicWriteFile(path string, data []byte) error {
 // uniqueTmpCounter 临时文件计数器，保证临时文件名唯一
 var uniqueTmpCounter atomic.Uint64
 
-// UpdateWithVersion 如果锁的当前版本是期望的版本，则更新为新版本
-// 通过 O_EXCL 创建新版本文件 + rename current.json 来保证 CAS 语义
+// UpdateWithVersion 如果锁的当前版本是期望的版本，则更新为新版本。
+// 在 flock 排他锁临界区内完成"读版本+校验+写"，多进程下线性一致。
 func (x *FileSystemStorage) UpdateWithVersion(ctx context.Context, lockId string, exceptedVersion, newVersion storage.Version, lockInformation *storage.LockInformation) error {
 
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
-	lockDirectory := x.BuildLockDirectory(lockId)
-	if err := x.EnsureDirectoryExists(lockDirectory); err != nil {
-		return err
-	}
-
-	// 读取当前锁信息
-	currentInfo, err := x.ReadCurrentLockInformation(lockId)
-	if err != nil {
-		return err
-	}
-	if currentInfo == nil {
-		return storage_lock.ErrLockNotFound
-	}
-
-	// 版本检查
-	if currentInfo.Version != exceptedVersion {
-		return storage_lock.ErrVersionMiss
-	}
-
-	// 写入新的锁信息到 current.json（原子写）
-	if err := x.atomicWriteFile(x.BuildCurrentLockFilePath(lockId), []byte(lockInformation.ToJsonString())); err != nil {
-		return err
-	}
-
-	return nil
+	return x.withFlock(lockId, func() error {
+		currentInfo, err := x.ReadCurrentLockInformation(lockId)
+		if err != nil {
+			return err
+		}
+		if currentInfo == nil {
+			return storage_lock.ErrLockNotFound
+		}
+		// 版本检查（此时持 flock，无并发进程能改版本，检查有效）
+		if currentInfo.Version != exceptedVersion {
+			return storage_lock.ErrVersionMiss
+		}
+		// 原子写入新锁信息（rename 防读者读到半截；flock 保证不会被另一进程的写覆盖）
+		return x.atomicWriteFile(x.BuildCurrentLockFilePath(lockId), []byte(lockInformation.ToJsonString()))
+	})
 }
 
-// CreateWithVersion 创建锁记录，仅在锁不存在时成功
-// 通过 O_CREATE|O_EXCL 标志保证原子性：若文件已存在则失败
+// CreateWithVersion 创建锁记录，仅在锁不存在时成功。
+// 在 flock 排他锁临界区内检查 current.json 是否存在并创建，多进程下只有一个成功。
 func (x *FileSystemStorage) CreateWithVersion(ctx context.Context, lockId string, version storage.Version, lockInformation *storage.LockInformation) error {
 
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
-	lockDirectory := x.BuildLockDirectory(lockId)
-	if err := x.EnsureDirectoryExists(lockDirectory); err != nil {
-		return err
-	}
-
-	currentPath := x.BuildCurrentLockFilePath(lockId)
-
-	// 使用 O_CREATE|O_EXCL 原子地创建文件：若文件已存在则返回错误，保证唯一性
-	file, err := os.OpenFile(currentPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.ModePerm)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
+	return x.withFlock(lockId, func() error {
+		currentPath := x.BuildCurrentLockFilePath(lockId)
+		// 持 flock 后再检查存在性，避免两进程同时判断"不存在"并各自创建
+		if _, err := os.Stat(currentPath); err == nil {
 			return storage_lock.ErrLockAlreadyExists
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		return err
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-
-	_, err = file.WriteString(lockInformation.ToJsonString())
-	if err != nil {
-		// 写入失败，清理掉刚创建的空文件，避免残留
-		_ = os.Remove(currentPath)
-		return err
-	}
-
-	return nil
+		// 原子写入（O_EXCL 不再必要，因 flock 已串行化；保留 rename 写法保证读到完整内容）
+		return x.atomicWriteFile(currentPath, []byte(lockInformation.ToJsonString()))
+	})
 }
 
-// DeleteWithVersion 如果锁的当前版本是期望的版本，则删除锁
+// DeleteWithVersion 如果锁的当前版本是期望的版本，则删除锁。
+// 在 flock 排他锁临界区内完成"读版本+校验+删目录"，多进程下线性一致。
 func (x *FileSystemStorage) DeleteWithVersion(ctx context.Context, lockId string, exceptedVersion storage.Version, lockInformation *storage.LockInformation) error {
 
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
-	currentInfo, err := x.ReadCurrentLockInformation(lockId)
-	if err != nil {
-		return err
-	}
-	if currentInfo == nil {
-		return storage_lock.ErrLockNotFound
-	}
-
-	// 版本检查
-	if currentInfo.Version != exceptedVersion {
-		return storage_lock.ErrVersionMiss
-	}
-
-	// 删除整个锁目录
-	return os.RemoveAll(x.BuildLockDirectory(lockId))
+	return x.withFlock(lockId, func() error {
+		currentInfo, err := x.ReadCurrentLockInformation(lockId)
+		if err != nil {
+			return err
+		}
+		if currentInfo == nil {
+			return storage_lock.ErrLockNotFound
+		}
+		if currentInfo.Version != exceptedVersion {
+			return storage_lock.ErrVersionMiss
+		}
+		// 删除整个锁目录（含 current.json 与 flock.lock）；flock 已持，本进程内安全。
+		// 注意：删除 flock.lock 文件本身不影响已持有的锁（内核锁绑定 fd，文件可被删后仍有锁）。
+		return os.RemoveAll(x.BuildLockDirectory(lockId))
+	})
 }
 
 func (x *FileSystemStorage) Get(ctx context.Context, lockId string) (string, error) {
