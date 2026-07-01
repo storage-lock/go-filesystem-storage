@@ -69,6 +69,7 @@ func (x *FileSystemStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
+		storage.CapabilityAtomicDelete,
 	}
 }
 
