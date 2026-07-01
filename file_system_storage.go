@@ -106,9 +106,16 @@ const (
 	// CurrentLockFileName 当前生效的锁信息存储在这个文件中
 	CurrentLockFileName = "current.json"
 
-	// FlockFileName 进程间互斥锁文件。所有 CAS 操作先对此文件加 flock 排他锁，
-	// 在临界区内完成"读版本+校验+写"，使多进程下 CAS 线性一致（修复漏洞 H）。
+	// FlockFileName 进程间互斥锁文件名。
+	// ⚠️ 关键：flock 锁的是【inode】而非路径。锁载体文件必须放在【永不被业务删除】的稳定位置
+	// （见 FlocksDirectoryName），否则 DeleteWithVersion 删除锁目录时会一并删除 flock.lock，
+	// 此后另一进程新建同名文件得到新 inode，旧 flock 不再保护新文件，互斥被绕过（漏洞 H-1）。
 	FlockFileName = "flock.lock"
+
+	// FlocksDirectoryName 存放所有 flock 锁载体文件的目录，位于 workspace 根下、锁目录之外。
+	// DeleteWithVersion 只删除锁目录（含 current.json），绝不触碰此目录，保证 flock 载体
+	// 文件的 inode 在锁的整个生命周期内稳定不变，flock 互斥始终有效。
+	FlocksDirectoryName = "flocks"
 )
 
 // IsLockDirectory 判断这个路径是否是一个存放锁的路径
@@ -133,23 +140,28 @@ func (x *FileSystemStorage) BuildCurrentLockFilePath(lockId string) string {
 	return filepath.Join(x.BuildLockDirectory(lockId), CurrentLockFileName)
 }
 
-// BuildFlockFilePath 进程间互斥锁文件的路径
+// BuildFlockFilePath 进程间互斥锁文件的路径。
+// 放在 workspace 根下的 flocks/ 目录中，【独立于锁目录】——这样 DeleteWithVersion
+// 删除锁目录时不会删除 flock 载体文件，保证其 inode 稳定，flock 互斥始终有效（修复漏洞 H-1）。
 func (x *FileSystemStorage) BuildFlockFilePath(lockId string) string {
-	return filepath.Join(x.BuildLockDirectory(lockId), FlockFileName)
+	return filepath.Join(x.workspace, FlocksDirectoryName, lockId+FlockFileName)
 }
 
-// withFlock 打开（必要时创建）flock.lock 文件并加排他锁，执行 fn 后释放。
+// withFlock 打开（必要时创建）flock 载体文件并加排他锁，执行 fn 后释放。
 // mu 已在调用方持有（串行化单进程内 goroutine），flock 再串行化不同进程，
 // 两层共同保证同一 lockId 的 CAS 全局只有一个进程在临界区内。
 //
+// flock 载体文件位于锁目录之外（见 BuildFlockFilePath），永不被业务删除，inode 稳定。
+//
 // 返回值：flock 加锁失败或 fn 的错误都会透传；fn 的错误不会阻止 unlock。
 func (x *FileSystemStorage) withFlock(lockId string, fn func() error) error {
-	lockDirectory := x.BuildLockDirectory(lockId)
-	if err := x.EnsureDirectoryExists(lockDirectory); err != nil {
+	// 确保存放 flock 载体文件的目录存在（独立于锁目录，永不被删除）
+	flocksDir := filepath.Join(x.workspace, FlocksDirectoryName)
+	if err := x.EnsureDirectoryExists(flocksDir); err != nil {
 		return err
 	}
 	flockPath := x.BuildFlockFilePath(lockId)
-	// O_CREATE：flock.lock 不存在则创建（内容无关，只用作锁载体）
+	// O_CREATE：flock 载体文件不存在则创建（内容无关，只用作锁载体）
 	f, err := os.OpenFile(flockPath, os.O_CREATE|os.O_RDWR, os.ModePerm)
 	if err != nil {
 		return err
@@ -206,6 +218,10 @@ func (x *FileSystemStorage) UpdateWithVersion(ctx context.Context, lockId string
 	defer x.mu.Unlock()
 
 	return x.withFlock(lockId, func() error {
+		// 锁目录可能不存在（首次创建或被 DeleteWithVersion 删除后），写 current.json 前确保存在
+		if err := x.EnsureDirectoryExists(x.BuildLockDirectory(lockId)); err != nil {
+			return err
+		}
 		currentInfo, err := x.ReadCurrentLockInformation(lockId)
 		if err != nil {
 			return err
@@ -230,6 +246,10 @@ func (x *FileSystemStorage) CreateWithVersion(ctx context.Context, lockId string
 	defer x.mu.Unlock()
 
 	return x.withFlock(lockId, func() error {
+		// 锁目录可能不存在，写 current.json 前确保存在
+		if err := x.EnsureDirectoryExists(x.BuildLockDirectory(lockId)); err != nil {
+			return err
+		}
 		currentPath := x.BuildCurrentLockFilePath(lockId)
 		// 持 flock 后再检查存在性，避免两进程同时判断"不存在"并各自创建
 		if _, err := os.Stat(currentPath); err == nil {
@@ -243,7 +263,13 @@ func (x *FileSystemStorage) CreateWithVersion(ctx context.Context, lockId string
 }
 
 // DeleteWithVersion 如果锁的当前版本是期望的版本，则删除锁。
-// 在 flock 排他锁临界区内完成"读版本+校验+删目录"，多进程下线性一致。
+// 在 flock 排他锁临界区内完成"读版本+校验+删锁目录"，多进程下线性一致。
+//
+// ⚠️ 关键（修复漏洞 H-1）：只删除锁目录（含 current.json），【绝不删除 flock 载体文件】。
+// flock 载体文件位于锁目录之外的 flocks/ 目录，inode 在锁的整个生命周期内稳定不变。
+// 若删除 flock 载体文件，另一进程会新建同名文件得到新 inode，旧 flock 不再保护新文件，
+// 互斥被绕过——这正是删除路径上的致命竞态。保留 flock 载体文件使该竞态无法发生。
+// flock 载体文件的轻微磁盘占用可接受（每个 lockId 一个 0 字节文件）。
 func (x *FileSystemStorage) DeleteWithVersion(ctx context.Context, lockId string, exceptedVersion storage.Version, lockInformation *storage.LockInformation) error {
 
 	x.mu.Lock()
