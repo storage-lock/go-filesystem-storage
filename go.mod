@@ -21,5 +21,3 @@ require (
 	github.com/storage-lock/go-utils v0.0.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/storage-lock/go-sql-based-storage => ../go-sql-based-storage
