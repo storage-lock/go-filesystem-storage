@@ -82,11 +82,16 @@ func (x *FileSystemStorage) GetName() string {
 func (x *FileSystemStorage) Capabilities() []storage.StorageCapability {
 	caps := []storage.StorageCapability{
 		storage.CapabilityReliableTime, // 单机本地时钟，单机内天然一致
+		storage.CapabilityWatch,
 	}
 	if flockSupported {
 		caps = append(caps, storage.CapabilityCAS, storage.CapabilityAtomicDelete)
 	}
 	return caps
+}
+
+func (x *FileSystemStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *FileSystemStorage) Init(ctx context.Context) error {
@@ -125,16 +130,23 @@ const (
 	FlocksDirectoryName = "flocks"
 )
 
-// IsLockDirectory 判断这个路径是否是一个存放锁的路径
+// IsLockDirectory 判断这个路径是否是一个存放锁的路径。
+// 既接受锁目录的全路径，也接受目录名（此时回退到 workspace 下查找）。
+// 注意：历史实现直接对传入路径做 HasPrefix 前缀判断，传入全路径时永远返回 false，
+// 导致 List 永远为空；现改为对 filepath.Base 做格式判断，stat 用原路径，
+// 原路径不存在时再回退到 workspace/Base 查找。
 func (x *FileSystemStorage) IsLockDirectory(path string) bool {
-	if !strings.HasPrefix(path, LockDirectoryPrefix) || !strings.HasSuffix(path, LockDirectorySuffix) {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, LockDirectoryPrefix) || !strings.HasSuffix(base, LockDirectorySuffix) {
 		return false
 	}
-	stat, err := os.Stat(path)
-	if err != nil {
-		return false
+	if stat, err := os.Stat(path); err == nil {
+		return stat.IsDir()
 	}
-	return stat.IsDir()
+	if stat, err := os.Stat(filepath.Join(x.workspace, base)); err == nil {
+		return stat.IsDir()
+	}
+	return false
 }
 
 // BuildLockDirectory 每个锁存放在一个独立的目录中
@@ -234,7 +246,12 @@ func (x *FileSystemStorage) UpdateWithVersion(ctx context.Context, lockId string
 			return err
 		}
 		if currentInfo == nil {
-			return storage_lock.ErrLockNotFound
+			// 注意：映射为 ErrVersionMiss 而不是 ErrLockNotFound——core 的 lockExpired/
+			// rlockReclaim 等抢占路径只把 ErrVersionMiss 当作"CAS 失败，可重试"，其它错误
+			// 会被当作硬错误直接返回。若真正的持有者恰好在这中间 DeleteWithVersion 真删了
+			// 记录（与本次抢占竞态，flock 只在单次调用内持有，两次调用之间仍可能被其它
+			// 进程抢先），"记录不存在"和"版本不匹配"对调用方而言是同一件事，应该重试。
+			return storage_lock.ErrVersionMiss
 		}
 		// 版本检查（此时持 flock，无并发进程能改版本，检查有效）
 		if currentInfo.Version != exceptedVersion {
